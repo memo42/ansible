@@ -77,6 +77,23 @@ options:
       - Whether to destroy and recreate an existing cache cluster if necessary in order to modify its state
     type: bool
     default: 'no'
+  tags:
+    description:
+      - Set instance tags
+    required: false
+    default: {}
+    version_added: "2.7"
+  purge_tags:
+    description:
+      - If yes, existing tags will be purged from the resource to match exactly
+        what is defined by I(tags) parameter. If the I(tags) parameter is not
+        set then tags will not be modified.
+    type: bool
+    required: false
+    default: yes
+    choices: [ 'yes', 'no' ]
+    version_added: "2.7"
+
 extends_documentation_fragment:
     - aws
     - ec2
@@ -110,11 +127,22 @@ EXAMPLES = """
     name: "test-please-delete"
     state: rebooted
 
+# Create cache cluster with Tags
+- elasticache:
+    name: "test-please-delete"
+    state: present
+    engine: redis
+    tags:
+      test: testa
+      testb: testc
+      testd: testf
 """
 from time import sleep
 from traceback import format_exc
-from ansible.module_utils.basic import AnsibleModule
-from ansible.module_utils.ec2 import ec2_argument_spec, get_aws_connection_info, boto3_conn, HAS_BOTO3, camel_dict_to_snake_dict
+from ansible.module_utils.aws.core import AnsibleAWSModule
+from ansible.module_utils.ec2 import ec2_argument_spec, get_aws_connection_info, boto3_conn, camel_dict_to_snake_dict
+from ansible.module_utils.ec2 import ansible_dict_to_boto3_tag_list, compare_aws_tags, boto3_tag_list_to_ansible_dict, HAS_BOTO3
+
 
 try:
     import boto3
@@ -132,7 +160,7 @@ class ElastiCacheManager(object):
     def __init__(self, module, name, engine, cache_engine_version, node_type,
                  num_nodes, cache_port, cache_parameter_group, cache_subnet_group,
                  cache_security_groups, security_group_ids, zone, wait,
-                 hard_modify, region, **aws_connect_kwargs):
+                 tags, purge_tags, hard_modify, region, **aws_connect_kwargs):
         self.module = module
         self.name = name
         self.engine = engine.lower()
@@ -147,6 +175,8 @@ class ElastiCacheManager(object):
         self.zone = zone
         self.wait = wait
         self.hard_modify = hard_modify
+        self.tags = tags
+        self.purge_tags = purge_tags
 
         self.region = region
         self.aws_connect_kwargs = aws_connect_kwargs
@@ -163,6 +193,26 @@ class ElastiCacheManager(object):
             self.sync()
         else:
             self.create()
+
+    def get_arn(self):
+        """ calculate and return the arn """
+        client = self.module.client('sts')
+        instance_counts = {}
+        response = client.get_caller_identity()
+        user_id = response['Account']
+        arn = "arn:aws:elasticache:" + self.region + ":" + user_id + ":cluster:" + self.name
+        return arn
+
+    def compare_and_update_tags(self):
+        """ compare existing tags to tags that are to be set and apply changes """
+        tags = boto3_tag_list_to_ansible_dict(self.conn.list_tags_for_resource(ResourceName=self.get_arn())['TagList'])
+        add, remove = compare_aws_tags(tags, self.tags, self.purge_tags)
+        if add:
+            self.conn.add_tags_to_resource(ResourceName=self.get_arn(), Tags=ansible_dict_to_boto3_tag_list(add))
+            self.changed = True
+        if remove:
+            self.conn.remove_tags_from_resource(ResourceName=self.get_arn(), TagKeys=remove)
+            self.changed = True
 
     def ensure_absent(self):
         """Ensure cache cluster is gone or delete it if not"""
@@ -202,6 +252,8 @@ class ElastiCacheManager(object):
                       CacheSubnetGroupName=self.cache_subnet_group)
         if self.cache_port is not None:
             kwargs['Port'] = self.cache_port
+        if self.tags is not None:
+            kwargs['Tags'] = ansible_dict_to_boto3_tag_list(self.tags)
         if self.zone is not None:
             kwargs['PreferredAvailabilityZone'] = self.zone
 
@@ -274,6 +326,8 @@ class ElastiCacheManager(object):
 
         if self._requires_modification():
             self.modify()
+
+        self.compare_and_update_tags()
 
     def modify(self):
         """Modify the cache cluster. Note it's only possible to modify a few select options."""
@@ -408,13 +462,8 @@ class ElastiCacheManager(object):
         return False
 
     def _get_elasticache_connection(self):
-        """Get an elasticache connection"""
-        region, ec2_url, aws_connect_params = get_aws_connection_info(self.module, boto3=True)
-        if region:
-            return boto3_conn(self.module, conn_type='client', resource='elasticache',
-                              region=region, endpoint=ec2_url, **aws_connect_params)
-        else:
-            self.module.fail_json(msg="region must be specified")
+        """ create and return an aws elasticache connection """
+        return self.module.client('elasticache')
 
     def _get_port(self):
         """Get the port. Where this information is retrieved from is engine dependent."""
@@ -481,10 +530,12 @@ def main():
         security_group_ids=dict(default=[], type='list'),
         zone=dict(),
         wait=dict(default=True, type='bool'),
-        hard_modify=dict(type='bool')
+        hard_modify=dict(type='bool'),
+        tags=dict(default={}, type='dict'),
+        purge_tags=dict(default=True, type='bool')
     ))
 
-    module = AnsibleModule(
+    module = AnsibleAWSModule(
         argument_spec=argument_spec,
     )
 
@@ -507,6 +558,8 @@ def main():
     wait = module.params['wait']
     hard_modify = module.params['hard_modify']
     cache_parameter_group = module.params['cache_parameter_group']
+    tags = module.params['tags']
+    purge_tags = module.params['purge_tags']
 
     if cache_subnet_group and cache_security_groups:
         module.fail_json(msg="Can't specify both cache_subnet_group and cache_security_groups")
@@ -520,7 +573,7 @@ def main():
                                              cache_parameter_group,
                                              cache_subnet_group,
                                              cache_security_groups,
-                                             security_group_ids, zone, wait,
+                                             security_group_ids, zone, wait, tags, purge_tags,
                                              hard_modify, region, **aws_connect_kwargs)
 
     if state == 'present':
